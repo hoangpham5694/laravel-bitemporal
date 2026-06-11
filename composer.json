@@ -1,0 +1,36 @@
+{
+  "name": "hoangphamdev/laravel-bitemporal",
+  "version": "1.0.0",
+  "description": "Model base bitemporal for laravel",
+  "type": "library",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "Hoang Pham",
+      "email": "hoangpham5694@gmail.com"
+    }
+  ],
+  "autoload": {
+    "psr-4": {
+      "HoangPhamDev\\Bitemporal\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "HoangPhamDev\\Bitemporal\\Tests\\": "tests/"
+    }
+  },
+
+  "extra": {
+    "laravel": {
+      "providers": [
+        "HoangPhamDev\\Bitemporal\\PackageServiceProvider"
+      ]
+    }
+  },
+  "require-dev": {
+    "orchestra/testbench": "^7.0",
+    "phpunit/phpunit": "^9.5",
+    "squizlabs/php_codesniffer": "*"
+  }
+}
