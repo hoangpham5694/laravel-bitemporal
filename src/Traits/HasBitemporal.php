@@ -2,19 +2,23 @@
 
 namespace HoangPhamDev\Bitemporal\Traits;
 
+use Carbon\Carbon;
 use HoangPhamDev\Bitemporal\Builders\BitemporalBuilder;
 use HoangPhamDev\Bitemporal\Support\BitemporalDefaults;
 use Illuminate\Database\Eloquent\Builder;
 use Carbon\CarbonInterface;
-use Illuminate\Support\Arr;
-use Illuminate\Support\Carbon;
+use Illuminate\Support\Str;
 use Illuminate\Support\Facades\DB;
 
 trait HasBitemporal
 {
+    protected ?CarbonInterface $bitemporalValidAt = null;
+
     public static function getBitemporalColumns(): array
     {
         return [
+            'record_uuid',
+            'operated_at',
             'valid_from',
             'valid_to',
             'transaction_from',
@@ -32,6 +36,16 @@ trait HasBitemporal
         static::addGlobalScope('bitemporal_current', function (Builder $builder): void {
             $builder->applyCurrentSnapshot();
         });
+
+        static::creating(function ($model): void {
+            if (empty($model->record_uuid)) {
+                $model->record_uuid = (string) Str::uuid();
+            }
+
+            if (empty($model->operated_at)) {
+                $model->operated_at = now();
+            }
+        });
     }
 
     public function scopeCurrent(Builder $query)
@@ -39,9 +53,9 @@ trait HasBitemporal
         return $query->applyCurrentSnapshot();
     }
 
-    public function scopeAsOf(Builder $query, $validAt = null, $transactionAt = null)
+    public function scopeAsOf(Builder $query, $validAt = null)
     {
-        return $query->applyCurrentSnapshot($validAt, $transactionAt);
+        return $query->asOf($validAt);
     }
 
     public function scopeWithoutBitemporal(Builder $query)
@@ -54,76 +68,125 @@ trait HasBitemporal
         return new BitemporalBuilder($query);
     }
 
-    public function delete($validAt = null)
+    public function setBitemporalValidAt($validAt): static
     {
-        return DB::connection($this->getConnectionName())->transaction(function () use ($validAt) {
-            return $this->bitemporalDelete($validAt, Carbon::now());
-        });
+        if ($validAt instanceof CarbonInterface) {
+            $this->bitemporalValidAt = Carbon::instance($validAt);
+
+            return $this;
+        }
+
+        if (is_null($validAt)) {
+            $this->bitemporalValidAt = null;
+
+            return $this;
+        }
+
+        $timezone = config('app.timezone', date_default_timezone_get());
+        $this->bitemporalValidAt = Carbon::parse($validAt, $timezone);
+
+        return $this;
     }
 
-    public function bitemporalDelete($validAt = null, $transactionAt = null): bool
+    public function getBitemporalValidAt(): ?CarbonInterface
+    {
+        return $this->bitemporalValidAt;
+    }
+
+    public function bitemporalDelete($validAt = null): bool
     {
         if (! $this->exists) {
             return false;
         }
 
-        $validAt = $validAt instanceof CarbonInterface
-            ? Carbon::instance($validAt)
-            : Carbon::parse($validAt ?? now());
+        $validAt = $validAt ?? $this->getBitemporalValidAt() ?? now();
 
-        $transactionAt = $transactionAt instanceof CarbonInterface
-            ? Carbon::instance($transactionAt)
-            : Carbon::parse($transactionAt ?? now());
+        return $this->bitemporalDeleteSince(
+            (string) $this->getAttribute('record_uuid'),
+            $validAt
+        );
+    }
 
-        $clone = $this->replicate();
-        $clone->forceFill([
-            'valid_to' => $validAt,
-            'transaction_from' => $transactionAt,
-            'transaction_to' => BitemporalDefaults::INFINITY_DATETIME,
-        ]);
-
-        $this->forceFill([
-            'transaction_to' => $validAt,
-        ]);
-
-        if (! $this->save()) {
+    public function bitemporalUpdate(array $data = [], $validAt = null): bool
+    {
+        if (! $this->exists) {
             return false;
         }
 
-        return $clone->save();
-    }
+        $recordUuid = (string) $this->getAttribute('record_uuid');
 
-    public static function destroy($ids): int
-    {
-        $ids = is_array($ids) ? $ids : func_get_args();
-        $ids = array_values(array_unique(array_filter(Arr::flatten($ids))));
-
-        if (empty($ids)) {
-            return 0;
+        if ($recordUuid === '') {
+            return false;
         }
 
-        $model = new static;
+        $timezone = config('app.timezone', date_default_timezone_get());
+        $validAt = $validAt instanceof CarbonInterface
+            ? Carbon::instance($validAt)->setTimezone($timezone)
+            : Carbon::parse($validAt ?? now(), $timezone);
 
-        return DB::connection($model->getConnectionName())->transaction(function () use ($model, $ids) {
-            $models = $model->newQueryWithoutScopes()->whereKey($ids)->get();
+        if ($this->bitemporalDeleteSince($recordUuid, $validAt) === false) {
+            return false;
+        }
 
-            foreach ($models as $record) {
-                $record->hardDelete();
+        $record = $this->newInstance();
+        $record->forceFill(array_merge([
+            'record_uuid' => $recordUuid,
+            'operated_at' => now(),
+            'valid_from' => $validAt,
+            'valid_to' => BitemporalDefaults::INFINITY_DATETIME,
+            'transaction_from' => now(),
+            'transaction_to' => BitemporalDefaults::INFINITY_DATETIME,
+        ], $data));
+
+        return $record->save();
+    }
+
+    protected function bitemporalDeleteSince(string $recordUuid, $validAt = null): bool
+    {
+        $timezone = config('app.timezone', date_default_timezone_get());
+        $validAt = $validAt instanceof CarbonInterface
+            ? Carbon::instance($validAt)->setTimezone($timezone)
+            : Carbon::parse($validAt ?? now(), $timezone);
+
+        $transactionAt = now();
+
+        return DB::connection($this->getConnectionName())->transaction(function () use ($recordUuid, $validAt, $transactionAt) {
+            $currentRecord = $this->newQueryWithoutScopes()
+                ->where('record_uuid', $recordUuid)
+                ->where('valid_from', '<=', $validAt)
+                ->where('valid_to', '>', $validAt)
+                ->where('transaction_to', BitemporalDefaults::INFINITY_DATETIME)
+                ->orderByDesc('valid_from')
+                ->first();
+
+            if (is_null($currentRecord)) {
+                return false;
             }
 
-            return $models->count();
+            $recordsToClose = $this->newQueryWithoutScopes()
+                ->where('record_uuid', $recordUuid)
+                ->where('valid_to', '>', $validAt)
+                ->where('transaction_to', BitemporalDefaults::INFINITY_DATETIME)
+                ->get();
+
+            foreach ($recordsToClose as $record) {
+                $record->newQueryWithoutScopes()
+                    ->whereKey($record->getKey())
+                    ->toBase()
+                    ->update([
+                        'transaction_to' => $transactionAt,
+                    ]);
+            }
+
+            $clone = $currentRecord->replicate();
+            $clone->forceFill([
+                'valid_to' => $validAt,
+                'transaction_from' => $transactionAt,
+                'transaction_to' => BitemporalDefaults::INFINITY_DATETIME,
+            ]);
+
+            return $clone->save();
         });
     }
 
-    public function hardDelete(): bool|null
-    {
-        if (! $this->exists) {
-            return false;
-        }
-
-        return (bool) $this->newQueryWithoutScopes()
-            ->toBase()
-            ->where($this->getQualifiedKeyName(), $this->getKey())
-            ->delete();
-    }
 }

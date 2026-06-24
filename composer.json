@@ -1,15 +1,28 @@
 {
   "name": "hoangphamdev/laravel-bitemporal",
-  "version": "1.0.0",
-  "description": "Model base bitemporal for laravel",
+  "description": "Laravel package for bitemporal Eloquent models",
   "type": "library",
   "license": "MIT",
+  "homepage": "https://github.com/hoangpham5694/laravel-bitemporal",
+  "keywords": [
+    "laravel",
+    "eloquent",
+    "bitemporal",
+    "temporal",
+    "versioning",
+    "package"
+  ],
   "authors": [
     {
       "name": "Hoang Pham",
       "email": "hoangpham5694@gmail.com"
     }
   ],
+  "require": {
+    "php": "^8.0",
+    "illuminate/database": "^9.0",
+    "illuminate/support": "^9.0"
+  },
   "autoload": {
     "psr-4": {
       "HoangPhamDev\\Bitemporal\\": "src/"
@@ -27,6 +40,10 @@
         "HoangPhamDev\\Bitemporal\\PackageServiceProvider"
       ]
     }
+  },
+  "support": {
+    "issues": "https://github.com/hoangpham5694/laravel-bitemporal/issues",
+    "source": "https://github.com/hoangpham5694/laravel-bitemporal"
   },
   "require-dev": {
     "orchestra/testbench": "^7.0",

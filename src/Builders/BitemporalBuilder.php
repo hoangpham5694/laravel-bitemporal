@@ -12,19 +12,28 @@ use Illuminate\Support\Facades\DB;
 
 class BitemporalBuilder extends Builder
 {
+    protected ?CarbonInterface $bitemporalValidAt = null;
+
     public function current(): static
     {
         return $this->asOf();
     }
 
-    public function asOf($validAt = null, $transactionAt = null): static
+    public function asOf($validAt = null): static
     {
-        return $this->applySnapshotConstraints(clone $this, $validAt, $transactionAt);
+        $query = clone $this;
+        $query->withoutGlobalScope('bitemporal_current');
+        $query->bitemporalValidAt = $this->normalizeDateTime($validAt ?? now());
+
+        return $this->applySnapshotConstraints(
+            $this->stripCurrentSnapshotConstraints($query),
+            $validAt
+        );
     }
 
-    public function applyCurrentSnapshot($validAt = null, $transactionAt = null): static
+    public function applyCurrentSnapshot($validAt = null): static
     {
-        return $this->applySnapshotConstraints($this, $validAt, $transactionAt);
+        return $this->applySnapshotConstraints($this, $validAt);
     }
 
     public function history(): static
@@ -38,12 +47,12 @@ class BitemporalBuilder extends Builder
             return $this->findMany($id, $columns);
         }
 
-        return $this->current()->whereKey($id)->first($columns);
+        return $this->whereKey($id)->first($columns);
     }
 
     public function findSole($id, $columns = ['*'])
     {
-        return $this->current()->whereKey($id)->sole($columns);
+        return $this->whereKey($id)->sole($columns);
     }
 
     public function findMany($ids, $columns = ['*'])
@@ -54,7 +63,7 @@ class BitemporalBuilder extends Builder
             return $this->model->newCollection();
         }
 
-        return $this->current()->whereKey($ids)->get($columns);
+        return $this->whereKey($ids)->get($columns);
     }
 
     public function findOrFail($id, $columns = ['*'])
@@ -106,7 +115,7 @@ class BitemporalBuilder extends Builder
         return $callback();
     }
 
-    public function delete($validAt = null): int
+    public function touch($column = null)
     {
         $models = $this->get();
 
@@ -114,44 +123,125 @@ class BitemporalBuilder extends Builder
             return 0;
         }
 
-        $transactionAt = now();
+        $touched = 0;
 
-        return DB::connection($this->model->getConnectionName())->transaction(function () use ($models, $validAt, $transactionAt) {
+        DB::connection($this->model->getConnectionName())->transaction(function () use ($models, $column, &$touched) {
             foreach ($models as $model) {
-                $model->bitemporalDelete($validAt, $transactionAt);
+                if ($model->touch($column)) {
+                    $touched++;
+                }
             }
-
-            return $models->count();
         });
+
+        return $touched;
     }
 
-    public function hardDelete(): int
+    public function getModels($columns = ['*'])
     {
-        return (int) $this->toBase()->delete();
+        $models = parent::getModels($columns);
+
+        if (! is_null($this->bitemporalValidAt)) {
+            foreach ($models as $model) {
+                if (method_exists($model, 'setBitemporalValidAt')) {
+                    $model->setBitemporalValidAt($this->bitemporalValidAt);
+                }
+            }
+        }
+
+        return $models;
     }
 
-    protected function applySnapshotConstraints(self $query, $validAt = null, $transactionAt = null): static
+    protected function applySnapshotConstraints(self $query, $validAt = null): static
     {
         $validAt = $this->normalizeDateTime($validAt ?? now());
-        $transactionAt = $this->normalizeDateTime($transactionAt ?? now());
 
         return $query
             ->where($this->model->qualifyColumn('valid_from'), '<=', $validAt)
             ->where($this->model->qualifyColumn('valid_to'), '>', $validAt)
-            ->where($this->model->qualifyColumn('transaction_from'), '<=', $transactionAt)
-            ->where($this->model->qualifyColumn('transaction_to'), '>', $transactionAt);
+            ->where($this->model->qualifyColumn('transaction_to'), '=', BitemporalDefaults::INFINITY_DATETIME);
     }
 
     protected function normalizeDateTime($value): Carbon
     {
+        $timezone = config('app.timezone', date_default_timezone_get());
+
         if ($value instanceof CarbonInterface) {
-            return Carbon::instance($value);
+            return Carbon::instance($value)->setTimezone($timezone);
         }
 
         if ($value === BitemporalDefaults::INFINITY_DATETIME) {
-            return Carbon::parse($value);
+            return Carbon::parse($value, $timezone);
         }
 
-        return Carbon::parse($value);
+        return Carbon::parse($value, $timezone);
     }
+
+    protected function stripCurrentSnapshotConstraints(self $query): static
+    {
+        $queryBuilder = $query->getQuery();
+        $wheres = $queryBuilder->wheres ?? [];
+
+        $columnsToStrip = [
+            $this->model->qualifyColumn('valid_from'),
+            $this->model->qualifyColumn('valid_to'),
+            $this->model->qualifyColumn('transaction_to'),
+        ];
+
+        $removed = [];
+
+        for ($index = count($wheres) - 1; $index >= 0; $index--) {
+            $where = $wheres[$index];
+
+            if (($where['type'] ?? null) !== 'Basic') {
+                continue;
+            }
+
+            $column = $where['column'] ?? null;
+
+            if (! in_array($column, $columnsToStrip, true)) {
+                continue;
+            }
+
+            $removed[] = $index;
+
+            if (count($removed) === 3) {
+                break;
+            }
+        }
+
+        if (empty($removed)) {
+            return $query;
+        }
+
+        rsort($removed);
+
+        foreach ($removed as $index) {
+            array_splice($wheres, $index, 1);
+        }
+
+        $queryBuilder->wheres = $wheres;
+        $queryBuilder->bindings['where'] = $this->rebuildWhereBindings($wheres);
+
+        return $query;
+    }
+
+    protected function rebuildWhereBindings(array $wheres): array
+    {
+        $bindings = [];
+
+        foreach ($wheres as $where) {
+            if (($where['type'] ?? null) !== 'Basic') {
+                continue;
+            }
+
+            if (! array_key_exists('value', $where)) {
+                continue;
+            }
+
+            $bindings[] = $where['value'];
+        }
+
+        return $bindings;
+    }
+
 }

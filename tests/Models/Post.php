@@ -20,6 +20,7 @@ class Post extends Model
     ];
 
     protected $casts = [
+        'operated_at' => 'datetime',
         'valid_from' => 'datetime',
         'valid_to' => 'datetime',
         'transaction_from' => 'datetime',
